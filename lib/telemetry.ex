@@ -244,4 +244,22 @@ defmodule LangChain.Telemetry do
   def retriever_get_relevant_documents_start(metadata) do
     start_event([:langchain, :retriever, :get_relevant_documents], metadata)
   end
+
+  # Agent Events
+
+  @doc """
+  Emits an agent run start event.
+  """
+  @spec agent_run_start(map()) :: (map() -> :ok)
+  def agent_run_start(metadata) do
+    start_event([:langchain, :agent, :run], metadata)
+  end
+
+  @doc """
+  Emits an agent step event.
+  """
+  @spec agent_step(map(), map()) :: :ok
+  def agent_step(measurements, metadata) do
+    emit_event([:langchain, :agent, :step], measurements, metadata)
+  end
 end

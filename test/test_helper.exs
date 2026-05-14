@@ -51,6 +51,14 @@ if Code.ensure_loaded?(ReqLLM) do
   Mimic.copy(LangChain.ChatModels.ChatReqLLM)
 end
 
+if Code.ensure_loaded?(:opentelemetry) do
+  # Start OpenTelemetry with a simple processor for testing
+  :application.set_env(:opentelemetry, :processor, :otel_simple_processor)
+  :application.set_env(:opentelemetry, :exporter, {:otel_console_exporter, []})
+  {:ok, _} = :application.ensure_all_started(:opentelemetry)
+  {:ok, _} = :application.ensure_all_started(:opentelemetry_exporter)
+end
+
 Logger.configure(level: :warning)
 ExUnit.configure(exclude: [live_call: true])
 

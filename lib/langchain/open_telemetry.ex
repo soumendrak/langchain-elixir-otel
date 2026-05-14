@@ -53,7 +53,8 @@ defmodule LangChain.OpenTelemetry do
   | `message.process` | `langchain.message.process` | message_type, role |
   """
 
-  @doc false
+  require OpenTelemetry.Tracer
+
   @telemetry_events [
     [:langchain, :llm, :call, :start],
     [:langchain, :llm, :call, :stop],
@@ -368,9 +369,12 @@ defmodule LangChain.OpenTelemetry do
 
   defp create_and_push_span(name, attributes) do
     parent_span = current_span()
-    parent_ctx = if parent_span, do: OpenTelemetry.Span.set_current(parent_span.span), else: %{}
 
     span = OpenTelemetry.Tracer.start_span(name, %{attributes: attributes})
+
+    if parent_span do
+      OpenTelemetry.Tracer.set_current_span(span)
+    end
 
     # Push onto the span stack so nested events create child spans
     stack = Process.get(@span_stack_key, [])

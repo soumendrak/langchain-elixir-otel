@@ -1,8 +1,6 @@
 defmodule LangChain.OpenTelemetryTest do
   use ExUnit.Case, async: false
 
-  import ExUnit.CaptureLog
-
   setup do
     # Detach any previous handler to start clean
     LangChain.OpenTelemetry.detach()

@@ -52,11 +52,11 @@ if Code.ensure_loaded?(ReqLLM) do
 end
 
 if Code.ensure_loaded?(:opentelemetry) do
-  # Start OpenTelemetry with a simple in-memory processor for testing
-  :otel_simple_processor = :opentelemetry.get_processor_module(:simple)
+  # Start OpenTelemetry with a simple processor for testing
   :application.set_env(:opentelemetry, :processor, :otel_simple_processor)
   :application.set_env(:opentelemetry, :exporter, {:otel_console_exporter, []})
-  :application.ensure_all_started(:opentelemetry)
+  {:ok, _} = :application.ensure_all_started(:opentelemetry)
+  {:ok, _} = :application.ensure_all_started(:opentelemetry_exporter)
 end
 
 Logger.configure(level: :warning)

@@ -69,7 +69,11 @@ defmodule LangChain.OpenTelemetry do
     [:langchain, :message, :process, :exception],
     [:langchain, :tool, :call, :start],
     [:langchain, :tool, :call, :stop],
-    [:langchain, :tool, :call, :exception]
+    [:langchain, :tool, :call, :exception],
+    [:langchain, :agent, :run, :start],
+    [:langchain, :agent, :run, :stop],
+    [:langchain, :agent, :run, :exception],
+    [:langchain, :agent, :step]
   ]
 
   @doc """
@@ -146,11 +150,13 @@ defmodule LangChain.OpenTelemetry do
 
     if span_ctx do
       if metadata[:result] do
-        status = case metadata[:result] do
-          {:ok, _} -> :ok
-          {:error, _} -> :error
-          _ -> :ok
-        end
+        status =
+          case metadata[:result] do
+            {:ok, _} -> :ok
+            {:error, _} -> :error
+            _ -> :ok
+          end
+
         OpenTelemetry.Span.set_status(span_ctx.span, status)
       end
 
@@ -184,15 +190,16 @@ defmodule LangChain.OpenTelemetry do
     span_ctx = current_span()
 
     if span_ctx do
-      prompt_text = case metadata[:messages] do
-        messages when is_list(messages) ->
-          Enum.map_join(messages, "\n", fn m ->
-            "#{m.role}: #{inspect(m.content)}"
-          end)
+      prompt_text =
+        case metadata[:messages] do
+          messages when is_list(messages) ->
+            Enum.map_join(messages, "\n", fn m ->
+              "#{m.role}: #{inspect(m.content)}"
+            end)
 
-        _ ->
-          inspect(metadata[:messages])
-      end
+          _ ->
+            inspect(metadata[:messages])
+        end
 
       OpenTelemetry.Span.set_attributes(span_ctx.span, %{
         "langchain.prompt" => String.slice(prompt_text || "", 0, 8000)
@@ -206,11 +213,12 @@ defmodule LangChain.OpenTelemetry do
     span_ctx = current_span()
 
     if span_ctx do
-      response_text = case metadata[:response] do
-        response when is_binary(response) -> response
-        response when is_map(response) -> inspect(response)
-        _ -> inspect(metadata[:response])
-      end
+      response_text =
+        case metadata[:response] do
+          response when is_binary(response) -> response
+          response when is_map(response) -> inspect(response)
+          _ -> inspect(metadata[:response])
+        end
 
       OpenTelemetry.Span.set_attributes(span_ctx.span, %{
         "langchain.response" => String.slice(response_text || "", 0, 8000)
@@ -238,11 +246,13 @@ defmodule LangChain.OpenTelemetry do
 
     if span_ctx do
       if metadata[:result] do
-        status = case metadata[:result] do
-          {:ok, _} -> :ok
-          {:error, _} -> :error
-          _ -> :ok
-        end
+        status =
+          case metadata[:result] do
+            {:ok, _} -> :ok
+            {:error, _} -> :error
+            _ -> :ok
+          end
+
         OpenTelemetry.Span.set_status(span_ctx.span, status)
       end
 
@@ -330,11 +340,12 @@ defmodule LangChain.OpenTelemetry do
 
     if span_ctx do
       if metadata[:result] do
-        status = case metadata[:result] do
-          {:ok, _} -> :ok
-          {:error, _} -> :error
-          _ -> :ok
-        end
+        status =
+          case metadata[:result] do
+            {:ok, _} -> :ok
+            {:error, _} -> :error
+            _ -> :ok
+          end
 
         OpenTelemetry.Span.set_status(span_ctx.span, status)
       end
@@ -358,6 +369,72 @@ defmodule LangChain.OpenTelemetry do
       end
 
       OpenTelemetry.Span.end_span(span_ctx.span)
+    end
+
+    :ok
+  end
+
+  # ── Agent Run Events ──────────────────────────────────────────────
+
+  def handle_event([:langchain, :agent, :run, :start], _measurements, metadata, _config) do
+    attrs = %{
+      "langchain.agent.task" => String.slice(metadata[:task] || "", 0, 200),
+      "langchain.agent.tool_count" => metadata[:tool_count] || 0,
+      "langchain.agent.max_iterations" => metadata[:max_iterations] || 15
+    }
+
+    span_name = "langchain.agent.run"
+    create_and_push_span(span_name, attrs)
+    :ok
+  end
+
+  def handle_event([:langchain, :agent, :run, :stop], _measurements, metadata, _config) do
+    span_ctx = pop_span()
+
+    if span_ctx do
+      status =
+        case metadata[:result] do
+          :ok -> :ok
+          _ -> :error
+        end
+
+      OpenTelemetry.Span.set_status(span_ctx.span, status)
+      OpenTelemetry.Span.end_span(span_ctx.span)
+    end
+
+    :ok
+  end
+
+  def handle_event([:langchain, :agent, :run, :exception], _measurements, metadata, _config) do
+    span_ctx = pop_span()
+
+    if span_ctx do
+      OpenTelemetry.Span.set_status(span_ctx.span, :error)
+
+      if metadata[:error] do
+        OpenTelemetry.Span.record_exception(span_ctx.span, metadata[:error],
+          stack_trace: metadata[:stacktrace]
+        )
+      end
+
+      OpenTelemetry.Span.end_span(span_ctx.span)
+    end
+
+    :ok
+  end
+
+  # ── Agent Step Events (add attribute to current span) ────────────
+
+  def handle_event([:langchain, :agent, :step], _measurements, metadata, _config) do
+    span_ctx = current_span()
+
+    if span_ctx do
+      step_type = metadata[:type] || "unknown"
+
+      OpenTelemetry.Span.add_event(span_ctx.span, "agent.step.#{step_type}", %{
+        "langchain.agent.step.type" => step_type,
+        "langchain.agent.step.content" => String.slice(metadata[:content] || "", 0, 1000)
+      })
     end
 
     :ok

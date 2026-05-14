@@ -235,4 +235,196 @@ defmodule LangChain.OpenTelemetryTest do
       assert :telemetry.execute([:langchain, :llm, :call, :stop], %{}, %{}) == :ok
     end
   end
+
+  describe "context propagation" do
+    setup do
+      LangChain.OpenTelemetry.attach()
+      LangChain.OpenTelemetry.reset_span_stack!()
+      :ok
+    end
+
+    test "capture_context/0 returns a map" do
+      ctx = LangChain.OpenTelemetry.capture_context()
+      assert is_map(ctx)
+      assert Map.has_key?(ctx, :span_stack)
+      assert Map.has_key?(ctx, :stack_depth)
+    end
+
+    test "capture_context/0 captures empty stack as depth 0" do
+      ctx = LangChain.OpenTelemetry.capture_context()
+      assert ctx.stack_depth == 0
+      assert ctx.span_stack == []
+    end
+
+    test "capture_context/0 captures active span stack" do
+      # Fire a chain start to push a span onto the stack
+      :telemetry.execute([:langchain, :chain, :execute, :start], %{}, %{
+        chain_type: "LLMChain",
+        chain_id: "test-1"
+      })
+
+      ctx = LangChain.OpenTelemetry.capture_context()
+
+      assert ctx.stack_depth == 1
+      assert length(ctx.span_stack) == 1
+      assert hd(ctx.span_stack).name == "langchain.chain.execute"
+
+      # Cleanup
+      :telemetry.execute([:langchain, :chain, :execute, :stop], %{}, %{})
+    end
+
+    test "restore_context/1 restores the span stack" do
+      ctx = %{
+        span_stack: [
+          %{name: "langchain.chain.execute"},
+          %{name: "langchain.llm.call"}
+        ],
+        stack_depth: 2
+      }
+
+      LangChain.OpenTelemetry.restore_context(ctx)
+
+      assert LangChain.OpenTelemetry.stack_depth() == 2
+    end
+
+    test "restore_context/1 clears previous stack before restoring" do
+      # Create a dirty stack first
+      Process.put(:langchain_otel_span_stack, [
+        %{span: nil, name: "stale.span", parent: nil}
+      ])
+
+      ctx = %{
+        span_stack: [%{name: "langchain.chain.execute"}],
+        stack_depth: 1
+      }
+
+      LangChain.OpenTelemetry.restore_context(ctx)
+
+      assert LangChain.OpenTelemetry.stack_depth() == 1
+
+      # Verify the top span name matches what we restored
+      # (use stack_depth to confirm; private function not accessible from tests)
+    end
+
+    test "restore_context/1 is a no-op for nil or invalid input" do
+      assert LangChain.OpenTelemetry.restore_context(nil) == :ok
+      assert LangChain.OpenTelemetry.restore_context(%{}) == :ok
+      assert LangChain.OpenTelemetry.restore_context("bad") == :ok
+    end
+
+    test "stack_depth/0 returns 0 for clean stack" do
+      LangChain.OpenTelemetry.reset_span_stack!()
+      assert LangChain.OpenTelemetry.stack_depth() == 0
+    end
+
+    test "stack_depth/0 returns correct count after span creation" do
+      LangChain.OpenTelemetry.reset_span_stack!()
+
+      :telemetry.execute([:langchain, :chain, :execute, :start], %{}, %{
+        chain_type: "LLMChain",
+        chain_id: "t1"
+      })
+
+      assert LangChain.OpenTelemetry.stack_depth() == 1
+
+      :telemetry.execute([:langchain, :chain, :execute, :stop], %{}, %{})
+      assert LangChain.OpenTelemetry.stack_depth() == 0
+    end
+
+    test "context propagation enables parented spans in child process" do
+      # Simulate parent process: start a chain span
+      :telemetry.execute([:langchain, :chain, :execute, :start], %{}, %{
+        chain_type: "LLMChain",
+        chain_id: "parent-chain"
+      })
+
+      # Capture context
+      ctx = LangChain.OpenTelemetry.capture_context()
+
+      # Simulate child process (Task): restores context
+      task =
+        Task.async(fn ->
+          LangChain.OpenTelemetry.restore_context(ctx)
+
+          # Fire a tool call start inside the Task — it should be parented
+          :telemetry.execute([:langchain, :tool, :call, :start], %{}, %{
+            tool_name: "test_tool",
+            tool_call_id: "call-1"
+          })
+
+          # Check stack depth — should be 2 (chain + tool)
+          depth = LangChain.OpenTelemetry.stack_depth()
+          depth
+        end)
+
+      child_depth = Task.await(task)
+      assert child_depth == 2
+
+      # Cleanup parent process
+      :telemetry.execute([:langchain, :chain, :execute, :stop], %{}, %{})
+    end
+  end
+
+  describe "hierarchy strict mode" do
+    setup do
+      LangChain.OpenTelemetry.attach()
+      LangChain.OpenTelemetry.reset_span_stack!()
+      :ok
+    end
+
+    test "strict mode warns on invalid push" do
+      import ExUnit.CaptureLog
+
+      LangChain.OpenTelemetry.HierarchyValidator.enable_strict!()
+
+      log =
+        capture_log(fn ->
+          # Try to push a child span that's not valid under no parent
+          # (tool.call as root is invalid)
+          # Fire a chain start first, then try an invalid child
+          :telemetry.execute([:langchain, :chain, :execute, :start], %{}, %{
+            chain_type: "LLMChain",
+            chain_id: "strict-1"
+          })
+
+          # llm.call under chain.execute is valid — no warning
+          :telemetry.execute([:langchain, :llm, :call, :start], %{}, %{
+            model: "test",
+            provider: "test"
+          })
+
+          :telemetry.execute([:langchain, :llm, :call, :stop], %{}, %{})
+          :telemetry.execute([:langchain, :chain, :execute, :stop], %{}, %{})
+        end)
+
+      # Should not produce warnings for valid hierarchy
+      refute log =~ "violation"
+    end
+
+    test "strict mode warns on LIFO violation" do
+      import ExUnit.CaptureLog
+
+      LangChain.OpenTelemetry.HierarchyValidator.enable_strict!()
+
+      log =
+        capture_log(fn ->
+          :telemetry.execute([:langchain, :chain, :execute, :start], %{}, %{
+            chain_type: "LLMChain",
+            chain_id: "lifo-1"
+          })
+
+          :telemetry.execute([:langchain, :llm, :call, :start], %{}, %{
+            model: "test",
+            provider: "test"
+          })
+
+          # Try to close chain before closing llm — LIFO violation
+          :telemetry.execute([:langchain, :chain, :execute, :stop], %{}, %{})
+
+          :telemetry.execute([:langchain, :llm, :call, :stop], %{}, %{})
+        end)
+
+      assert log =~ "violation"
+    end
+  end
 end

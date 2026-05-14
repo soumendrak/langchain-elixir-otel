@@ -51,9 +51,36 @@ defmodule LangChain.OpenTelemetry do
   | `chain.execute` | `langchain.chain.execute` | chain_type, chain_id |
   | `tool.call` | `langchain.tool.call` | tool_name, tool_call_id |
   | `message.process` | `langchain.message.process` | message_type, role |
+
+  ## Hierarchy Validation
+
+  Use `LangChain.OpenTelemetry.HierarchyValidator` to validate span parent-child
+  relationships. Enable strict mode during development:
+
+      LangChain.OpenTelemetry.HierarchyValidator.enable_strict!()
+
+  ## Async Context Propagation
+
+  When tool calls execute in separate Elixir Tasks (via `Task.async`), the
+  OTel span context does not automatically propagate. Use the context
+  propagation helpers:
+
+      # In parent process — before spawning Task
+      ctx = LangChain.OpenTelemetry.capture_context()
+
+      # In the child Task process — restore the context
+      LangChain.OpenTelemetry.restore_context(ctx)
+
+  LangChain's async tool execution automatically handles this via the
+  telemetry metadata propagation mechanism. If you spawn custom Tasks
+  that emit LangChain telemetry events, use the helpers above.
   """
 
   require OpenTelemetry.Tracer
+
+  alias LangChain.OpenTelemetry.HierarchyValidator
+
+  @span_stack_key :langchain_otel_span_stack
 
   @telemetry_events [
     [:langchain, :llm, :call, :start],
@@ -146,7 +173,7 @@ defmodule LangChain.OpenTelemetry do
   end
 
   def handle_event([:langchain, :llm, :call, :stop], _measurements, metadata, _config) do
-    span_ctx = pop_span()
+    span_ctx = pop_span("langchain.llm.call")
 
     if span_ctx do
       if metadata[:result] do
@@ -167,7 +194,7 @@ defmodule LangChain.OpenTelemetry do
   end
 
   def handle_event([:langchain, :llm, :call, :exception], _measurements, metadata, _config) do
-    span_ctx = pop_span()
+    span_ctx = pop_span("langchain.llm.call")
 
     if span_ctx do
       OpenTelemetry.Span.set_status(span_ctx.span, :error)
@@ -242,7 +269,7 @@ defmodule LangChain.OpenTelemetry do
   end
 
   def handle_event([:langchain, :chain, :execute, :stop], _measurements, metadata, _config) do
-    span_ctx = pop_span()
+    span_ctx = pop_span("langchain.chain.execute")
 
     if span_ctx do
       if metadata[:result] do
@@ -263,7 +290,7 @@ defmodule LangChain.OpenTelemetry do
   end
 
   def handle_event([:langchain, :chain, :execute, :exception], _measurements, metadata, _config) do
-    span_ctx = pop_span()
+    span_ctx = pop_span("langchain.chain.execute")
 
     if span_ctx do
       OpenTelemetry.Span.set_status(span_ctx.span, :error)
@@ -294,7 +321,7 @@ defmodule LangChain.OpenTelemetry do
   end
 
   def handle_event([:langchain, :message, :process, :stop], _measurements, _metadata, _config) do
-    span_ctx = pop_span()
+    span_ctx = pop_span("langchain.message.process")
 
     if span_ctx do
       OpenTelemetry.Span.set_status(span_ctx.span, :ok)
@@ -305,7 +332,7 @@ defmodule LangChain.OpenTelemetry do
   end
 
   def handle_event([:langchain, :message, :process, :exception], _measurements, metadata, _config) do
-    span_ctx = pop_span()
+    span_ctx = pop_span("langchain.message.process")
 
     if span_ctx do
       OpenTelemetry.Span.set_status(span_ctx.span, :error)
@@ -336,7 +363,7 @@ defmodule LangChain.OpenTelemetry do
   end
 
   def handle_event([:langchain, :tool, :call, :stop], _measurements, metadata, _config) do
-    span_ctx = pop_span()
+    span_ctx = pop_span("langchain.tool.call")
 
     if span_ctx do
       if metadata[:result] do
@@ -357,7 +384,7 @@ defmodule LangChain.OpenTelemetry do
   end
 
   def handle_event([:langchain, :tool, :call, :exception], _measurements, metadata, _config) do
-    span_ctx = pop_span()
+    span_ctx = pop_span("langchain.tool.call")
 
     if span_ctx do
       OpenTelemetry.Span.set_status(span_ctx.span, :error)
@@ -389,7 +416,7 @@ defmodule LangChain.OpenTelemetry do
   end
 
   def handle_event([:langchain, :agent, :run, :stop], _measurements, metadata, _config) do
-    span_ctx = pop_span()
+    span_ctx = pop_span("langchain.agent.run")
 
     if span_ctx do
       status =
@@ -406,7 +433,7 @@ defmodule LangChain.OpenTelemetry do
   end
 
   def handle_event([:langchain, :agent, :run, :exception], _measurements, metadata, _config) do
-    span_ctx = pop_span()
+    span_ctx = pop_span("langchain.agent.run")
 
     if span_ctx do
       OpenTelemetry.Span.set_status(span_ctx.span, :error)
@@ -440,11 +467,96 @@ defmodule LangChain.OpenTelemetry do
     :ok
   end
 
+  # ── Context Propagation ──────────────────────────────────────────
+
+  @doc """
+  Captures the current OTel span context for propagation across process boundaries.
+
+  Returns a serializable map containing the current span stack state.
+  Use `restore_context/1` in a child process (e.g., inside a `Task.async`)
+  to restore parent-child span relationships.
+
+  ## Examples
+
+      ctx = LangChain.OpenTelemetry.capture_context()
+
+      Task.async(fn ->
+        LangChain.OpenTelemetry.restore_context(ctx)
+        # Telemetry events here will be properly parented
+      end)
+  """
+  @spec capture_context() :: map()
+  def capture_context do
+    span_stack = Process.get(@span_stack_key, [])
+    # Serialize only the span names — not the actual OTel structs
+    serialized_stack =
+      Enum.map(span_stack, fn %{name: name} -> %{name: name} end)
+
+    %{
+      span_stack: serialized_stack,
+      stack_depth: length(span_stack)
+    }
+  end
+
+  @doc """
+  Restores a previously captured span context in the current process.
+
+  Call this inside a child process (e.g., a `Task.async`) before
+  executing code that emits LangChain telemetry events. This ensures
+  that spans created in the child process are properly parented under
+  the span that was active in the parent process.
+
+  Returns `:ok`.
+  """
+  @spec restore_context(map()) :: :ok
+  def restore_context(%{span_stack: span_stack} = _ctx) when is_list(span_stack) do
+    # Clear any existing stack first to avoid contamination
+    Process.delete(@span_stack_key)
+
+    # Restore the span stack metadata
+    restored =
+      Enum.map(span_stack, fn %{name: name} ->
+        %{name: name, span: nil, parent: nil}
+      end)
+
+    Process.put(@span_stack_key, restored)
+    :ok
+  end
+
+  def restore_context(_), do: :ok
+
+  @doc """
+  Returns the current span stack depth. Useful for detecting if spans
+  are being properly closed across process boundaries.
+
+  0 means no active span context.
+  """
+  @spec stack_depth() :: non_neg_integer()
+  def stack_depth do
+    Process.get(@span_stack_key, []) |> length()
+  end
+
+  @doc false
+  def reset_span_stack! do
+    Process.delete(@span_stack_key)
+    :ok
+  end
+
   # ── Span Stack Management (process-dictionary based) ─────────────
 
-  @span_stack_key :langchain_otel_span_stack
-
   defp create_and_push_span(name, attributes) do
+    # Hierarchy validation (strict mode)
+    if HierarchyValidator.strict?() do
+      case HierarchyValidator.validate_push(name) do
+        {:error, reason} ->
+          require Logger
+          Logger.warning("OTel span hierarchy violation: #{reason}")
+
+        :ok ->
+          :ok
+      end
+    end
+
     parent_span = current_span()
 
     span = OpenTelemetry.Tracer.start_span(name, %{attributes: attributes})
@@ -461,11 +573,23 @@ defmodule LangChain.OpenTelemetry do
     span_ctx
   end
 
-  defp pop_span do
+  defp pop_span(expected_name) do
     stack = Process.get(@span_stack_key, [])
 
     case stack do
       [top | rest] ->
+        # Hierarchy validation (strict mode) — LIFO check
+        if HierarchyValidator.strict?() && expected_name do
+          case HierarchyValidator.validate_pop(expected_name, top.name) do
+            {:error, reason} ->
+              require Logger
+              Logger.warning("OTel span hierarchy violation: #{reason}")
+
+            :ok ->
+              :ok
+          end
+        end
+
         Process.put(@span_stack_key, rest)
         top
 

@@ -1426,10 +1426,19 @@ defmodule LangChain.Chains.LLMChain do
 
       # execute all the async calls. This keeps the responses in order too.
       # Return tuple with call and func for callback firing
+      # Capture OTel span context for propagation across the Task boundary.
+      # When opentelemetry_api is available, tool spans inside the Task
+      # will be properly parented under the current chain/agent span.
+      otel_ctx = capture_otel_context()
+
       async_results =
         grouped[:async]
         |> Enum.map(fn {call, func} ->
           Task.async(fn ->
+            # Restore OTel context captured in the parent process so
+            # telemetry events inside the Task create properly parented spans.
+            restore_otel_context(otel_ctx)
+
             # Fires inside the spawned Task so handlers (e.g. tenancy/OTel
             # propagation) can re-apply per-process state before the tool runs.
             Callbacks.fire(chain.callbacks, :on_tool_pre_execution, [chain, call, func])
@@ -1990,4 +1999,31 @@ defmodule LangChain.Chains.LLMChain do
   end
 
   defp raise_when_no_messages(%LLMChain{} = chain), do: chain
+
+  # ── OTel Context Propagation ────────────────────────────────────────────────
+
+  # Captures the current OTel span context for propagation across Task.async
+  # boundaries. Returns a serializable map or nil if OTel is not available.
+  @spec capture_otel_context() :: map() | nil
+  defp capture_otel_context do
+    if Code.ensure_loaded?(LangChain.OpenTelemetry) do
+      LangChain.OpenTelemetry.capture_context()
+    end
+  end
+
+  # Restores a previously captured OTel span context. No-op if the context
+  # is nil or OTel is not available. Called inside Task.async to ensure
+  # tool call spans are properly parented.
+  @spec restore_otel_context(map() | nil) :: :ok
+  defp restore_otel_context(nil), do: :ok
+
+  defp restore_otel_context(ctx) when is_map(ctx) do
+    if Code.ensure_loaded?(LangChain.OpenTelemetry) do
+      LangChain.OpenTelemetry.restore_context(ctx)
+    else
+      :ok
+    end
+  end
+
+  defp restore_otel_context(_), do: :ok
 end

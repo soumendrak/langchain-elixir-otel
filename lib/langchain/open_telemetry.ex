@@ -47,10 +47,15 @@ defmodule LangChain.OpenTelemetry do
 
   | Telemetry Event | OTel Span Name | Attributes |
   |---|---|---|
-  | `llm.call` | `langchain.llm.call` | model, provider, message_count, tools_count |
+  | `llm.call` | `langchain.llm.call` | model, provider, message_count, tools_count + gen_ai.request.model, gen_ai.system |
   | `chain.execute` | `langchain.chain.execute` | chain_type, chain_id |
   | `tool.call` | `langchain.tool.call` | tool_name, tool_call_id |
   | `message.process` | `langchain.message.process` | message_type, role |
+  | `agent.run` | `langchain.agent.run` | task, tool_count, max_iterations |
+
+  LLM call spans also receive `gen_ai.usage.*` (prompt_tokens, completion_tokens,
+  total_tokens) and `gen_ai.response.id` attributes from the response event
+  when the data is available.
 
   ## Hierarchy Validation
 
@@ -79,6 +84,7 @@ defmodule LangChain.OpenTelemetry do
   require OpenTelemetry.Tracer
 
   alias LangChain.OpenTelemetry.HierarchyValidator
+  alias LangChain.OpenTelemetry.SemanticConventions
 
   @span_stack_key :langchain_otel_span_stack
 
@@ -160,12 +166,18 @@ defmodule LangChain.OpenTelemetry do
   # ── LLM Call Events ──────────────────────────────────────────────
 
   def handle_event([:langchain, :llm, :call, :start], _measurements, metadata, _config) do
-    attrs = %{
-      "langchain.model" => metadata[:model] || "unknown",
-      "langchain.provider" => metadata[:provider] || "unknown",
-      "langchain.message_count" => metadata[:message_count] || 0,
-      "langchain.tools_count" => metadata[:tools_count] || 0
-    }
+    gen_ai_attrs = SemanticConventions.request_attributes(metadata)
+
+    attrs =
+      Map.merge(
+        %{
+          "langchain.model" => metadata[:model] || "unknown",
+          "langchain.provider" => metadata[:provider] || "unknown",
+          "langchain.message_count" => metadata[:message_count] || 0,
+          "langchain.tools_count" => metadata[:tools_count] || 0
+        },
+        gen_ai_attrs
+      )
 
     span_name = metadata[:span_name] || "langchain.llm.call"
     create_and_push_span(span_name, attrs)
@@ -176,6 +188,25 @@ defmodule LangChain.OpenTelemetry do
     span_ctx = pop_span("langchain.llm.call")
 
     if span_ctx do
+      # Add gen_ai.usage.* attributes from the result
+      case metadata[:result] do
+        {:ok, result} when is_map(result) ->
+          if result[:usage] do
+            usage_attrs = SemanticConventions.usage_attributes(result[:usage])
+            OpenTelemetry.Span.set_attributes(span_ctx.span, usage_attrs)
+          end
+
+        _ ->
+          :ok
+      end
+
+      # Add gen_ai.response.* attributes if present in stop metadata
+      resp_attrs = SemanticConventions.response_attributes(metadata)
+
+      if resp_attrs != %{} do
+        OpenTelemetry.Span.set_attributes(span_ctx.span, resp_attrs)
+      end
+
       if metadata[:result] do
         status =
           case metadata[:result] do
@@ -228,9 +259,20 @@ defmodule LangChain.OpenTelemetry do
             inspect(metadata[:messages])
         end
 
-      OpenTelemetry.Span.set_attributes(span_ctx.span, %{
+      attrs = %{
         "langchain.prompt" => String.slice(prompt_text || "", 0, 8000)
-      })
+      }
+
+      model = metadata[:model] || metadata["model"]
+
+      attrs =
+        if model do
+          Map.put(attrs, "gen_ai.request.model", model)
+        else
+          attrs
+        end
+
+      OpenTelemetry.Span.set_attributes(span_ctx.span, attrs)
     end
 
     :ok
@@ -247,9 +289,41 @@ defmodule LangChain.OpenTelemetry do
           _ -> inspect(metadata[:response])
         end
 
-      OpenTelemetry.Span.set_attributes(span_ctx.span, %{
+      attrs = %{
         "langchain.response" => String.slice(response_text || "", 0, 8000)
-      })
+      }
+
+      # Extract gen_ai.usage attributes from response data
+      usage_attrs =
+        case metadata[:response] do
+          %{metadata: %{usage: %{input: _, output: _} = usage}} ->
+            SemanticConventions.usage_attributes(usage)
+
+          %{usage: %{input: _, output: _} = usage} ->
+            SemanticConventions.usage_attributes(usage)
+
+          _ ->
+            %{}
+        end
+
+      # Extract gen_ai.response.id from response if available
+      response_id =
+        case metadata[:response] do
+          %{id: id} when is_binary(id) -> id
+          %{"id" => id} when is_binary(id) -> id
+          _ -> nil
+        end
+
+      resp_attrs =
+        if response_id do
+          Map.put(usage_attrs, "gen_ai.response.id", response_id)
+        else
+          usage_attrs
+        end
+
+      all_attrs = Map.merge(attrs, resp_attrs)
+
+      OpenTelemetry.Span.set_attributes(span_ctx.span, all_attrs)
     end
 
     :ok

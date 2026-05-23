@@ -427,4 +427,101 @@ defmodule LangChain.OpenTelemetryTest do
       assert log =~ "violation"
     end
   end
+
+  describe "gen_ai semantic conventions" do
+    setup do
+      LangChain.OpenTelemetry.attach()
+      LangChain.OpenTelemetry.reset_span_stack!()
+      :ok
+    end
+
+    test "includes gen_ai attributes on llm call start" do
+      assert :telemetry.execute([:langchain, :llm, :call, :start], %{}, %{
+               model: "gpt-4-turbo",
+               provider: "openai",
+               message_count: 5,
+               tools_count: 2
+             }) == :ok
+
+      # The span was created with gen_ai attributes — verify stack depth
+      assert LangChain.OpenTelemetry.stack_depth() == 1
+
+      assert :telemetry.execute([:langchain, :llm, :call, :stop], %{}, %{}) == :ok
+    end
+
+    test "includes gen_ai usage attributes on llm response with token usage" do
+      assert :telemetry.execute([:langchain, :llm, :call, :start], %{}, %{
+               model: "gpt-4",
+               provider: "openai"
+             }) == :ok
+
+      assert :telemetry.execute([:langchain, :llm, :response], %{}, %{
+               model: "gpt-4",
+               response: %{
+                 id: "chatcmpl-123",
+                 model: "gpt-4",
+                 usage: %LangChain.TokenUsage{
+                   input: 50,
+                   output: 100,
+                   raw: %{"total_tokens" => 150}
+                 }
+               }
+             }) == :ok
+
+      assert :telemetry.execute([:langchain, :llm, :call, :stop], %{}, %{}) == :ok
+    end
+
+    test "response with id sets gen_ai.response.id" do
+      assert :telemetry.execute([:langchain, :llm, :call, :start], %{}, %{
+               model: "gpt-4",
+               provider: "openai"
+             }) == :ok
+
+      assert :telemetry.execute([:langchain, :llm, :response], %{}, %{
+               model: "gpt-4",
+               response: %{id: "chatcmpl-abc123", model: "gpt-4"}
+             }) == :ok
+
+      assert :telemetry.execute([:langchain, :llm, :call, :stop], %{}, %{}) == :ok
+    end
+
+    test "prompt event adds gen_ai.request.model attribute" do
+      assert :telemetry.execute([:langchain, :llm, :call, :start], %{}, %{
+               model: "gpt-4",
+               provider: "openai"
+             }) == :ok
+
+      assert :telemetry.execute([:langchain, :llm, :prompt], %{}, %{
+               model: "gpt-4",
+               messages: [%{role: :user, content: "Hello"}]
+             }) == :ok
+
+      assert :telemetry.execute([:langchain, :llm, :call, :stop], %{}, %{}) == :ok
+    end
+
+    test "unknown model still works" do
+      assert :telemetry.execute([:langchain, :llm, :call, :start], %{}, %{
+               model: "custom-model-xyz",
+               provider: "custom"
+             }) == :ok
+
+      assert :telemetry.execute([:langchain, :llm, :call, :stop], %{}, %{}) == :ok
+    end
+
+    test "gen_ai attributes work inside chain hierarchy" do
+      assert :telemetry.execute([:langchain, :chain, :execute, :start], %{}, %{
+               chain_type: "LLMChain",
+               chain_id: "chain-spec-1"
+             }) == :ok
+
+      assert :telemetry.execute([:langchain, :llm, :call, :start], %{}, %{
+               model: "claude-3-sonnet",
+               provider: "anthropic"
+             }) == :ok
+
+      assert :telemetry.execute([:langchain, :llm, :call, :stop], %{}, %{}) == :ok
+
+      assert :telemetry.execute([:langchain, :chain, :execute, :stop], %{}, %{}) == :ok
+    end
+  end
 end
